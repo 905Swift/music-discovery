@@ -1,0 +1,7 @@
+# Never upload login files to GitHub
+browser.json
+headers.txt
+oauth.json
+__pycache__/
+*.pyc
+.venv/
