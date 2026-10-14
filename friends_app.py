@@ -254,13 +254,15 @@ def generate(yt, seed_queries, known_keys, settings, progress):
 
     for i, query in enumerate(seed_queries, start=1):
         progress.progress((i - 1) / total, text=f"Looking up: {query}")
+        seed = None
+        reason = "no results found"
         try:
             hits = yt.search(query, filter="songs")
             seed = next((h for h in hits if h.get("videoId")), None)
-        except Exception:
-            seed = None
+        except Exception as error:
+            reason = f"search failed: {type(error).__name__}: {str(error)[:150]}"
         if not seed:
-            missed.append(query)
+            missed.append(f"{query} ({reason})")
             continue
 
         seed_artists = artist_names(seed)
@@ -269,8 +271,9 @@ def generate(yt, seed_queries, known_keys, settings, progress):
 
         try:
             radio = fetch_radio(seed["videoId"])
-        except Exception:
-            missed.append(f"{query} (couldn't get similar songs)")
+        except Exception as error:
+            reason = f"{type(error).__name__}: {str(error)[:150]}"
+            missed.append(f"{query} (couldn't get similar songs: {reason})")
             continue
 
         seen = set()
