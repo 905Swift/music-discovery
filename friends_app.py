@@ -1,36 +1,47 @@
 """
-Music Discovery for Friends  -  find new songs and take the list to YouTube Music, Spotify, or Apple Music.
+Music Discovery for Friends (Last.fm edition)
 
-No logins and no accounts: it never touches anyone's streaming account.
-You get a list you can copy, download, or turn into a YouTube playlist link.
+Tell it some songs you like and it finds similar ones using Last.fm's listening data.
+No logins and no streaming accounts: you get a list you can copy or download and
+move to Spotify, YouTube Music, or Apple Music with a free playlist-transfer site.
 
-Run it on your own computer:   streamlit run friends_app.py
+Needs a free Last.fm API key (https://www.last.fm/api/account/create).
+Keep the key in Streamlit "secrets" (never in your code or on GitHub):
+
+    LASTFM_API_KEY = "your-key-here"
+
+Run it on your own computer:   streamlit run friends_lastfm.py
 """
 
 import csv
 import hashlib
 import io
 import json
+import os
 import random
 import re
 import zipfile
 from collections import Counter
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
+import requests
 import streamlit as st
-from ytmusicapi import YTMusic
 
 # ---------------------------------------------------------------
 # Settings (kept small so one person can't overload the app)
 # ---------------------------------------------------------------
-EXAMPLE_SONGS = """Blinding Lights The Weeknd
-Levitating Dua Lipa
-Heat Waves Glass Animals"""
+API_URL = "https://ws.audioscrobbler.com/2.0/"
+USER_AGENT = "MusicDiscoveryForFriends/1.0"
+
+EXAMPLE_SONGS = """Blinding Lights - The Weeknd
+Levitating - Dua Lipa
+Heat Waves - Glass Animals"""
 
 MAX_SEEDS = 15           # most seed songs per run
-RADIO_SIZE = 30          # similar songs fetched per seed song
+SIMILAR_LIMIT = 50       # similar songs requested per seed
+FALLBACK_LIMIT = 4       # how many seeds per run may use the slower artist-based fallback
 MAX_PLAYLIST_SIZE = 60
-LINK_CHUNK = 20          # songs per "open as YouTube playlist" link
 MIN_MS_PLAYED = 30_000   # a Spotify play only counts if you listened 30+ seconds
 RANGE_DAYS = {
     "All time": None,
@@ -105,16 +116,18 @@ def language_ok(choice, text):
     return guess == wanted
 
 
-def passes_filters(title, artists_text, video_type, settings):
+def passes_filters(title, artist, settings):
     if settings["skip_live"] and LIVE_PATTERN.search(title):
         return False
     if settings["skip_remix"] and REMIX_PATTERN.search(title):
         return False
     if settings["skip_instrumental"] and INSTRUMENTAL_PATTERN.search(title):
         return False
-    if settings["skip_ugc"] and video_type and "UGC" in str(video_type):
-        return False
-    return language_ok(settings["language"], f"{title} {artists_text}")
+    return language_ok(settings["language"], f"{title} {artist}")
+
+
+def escape_markdown(text):
+    return re.sub(r"([*_\[\]`~])", r"\\\1", str(text))
 
 
 # ---------------------------------------------------------------
@@ -211,116 +224,199 @@ def analyze_spotify_for_session(uploads, time_range):
 
 
 # ---------------------------------------------------------------
-# YouTube Music (public search, no login)
+# Last.fm
 # ---------------------------------------------------------------
-@st.cache_resource
-def get_yt():
-    return YTMusic()
+class LastFmError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 
-def artist_names(track):
-    artists = track.get("artists") or []
-    names = [a.get("name", "") for a in artists if isinstance(a, dict) and a.get("name")]
-    return names or ["Unknown artist"]
+def get_api_key():
+    try:
+        key = st.secrets.get("LASTFM_API_KEY")
+    except Exception:
+        key = None
+    return key or os.environ.get("LASTFM_API_KEY")
+
+
+def as_list(value):
+    if not value:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def name_of(value):
+    """Last.fm gives an artist as text in some replies and as an object in others."""
+    if isinstance(value, dict):
+        return value.get("name") or value.get("#text") or ""
+    return value or ""
+
+
+def lastfm_call(method, **params):
+    key = get_api_key()
+    if not key:
+        raise LastFmError(10, "No Last.fm API key is set up")
+    query = {"method": method, "api_key": key, "format": "json", **params}
+    try:
+        response = requests.get(
+            API_URL, params=query, timeout=15, headers={"User-Agent": USER_AGENT}
+        )
+    except requests.RequestException as error:
+        # Don't print the error text itself: it can contain the web address with the key in it.
+        raise LastFmError(0, f"Network problem ({type(error).__name__})")
+    try:
+        data = response.json()
+    except ValueError:
+        raise LastFmError(0, f"Unexpected reply from Last.fm (HTTP {response.status_code})")
+    if isinstance(data, dict) and "error" in data:
+        raise LastFmError(int(data["error"]), data.get("message", "Last.fm error"))
+    return data
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_radio(video_id):
-    """Similar songs for one song. Cached for an hour so repeat lookups are free.
-    (Only public song IDs are used as the cache key. Failures are not cached.)"""
-    radio = get_yt().get_watch_playlist(videoId=video_id, radio=True, limit=RADIO_SIZE)
-    tracks = []
-    for track in radio.get("tracks", []):
-        vid = track.get("videoId")
-        if vid:
-            tracks.append(
-                {
-                    "videoId": vid,
-                    "title": track.get("title", "Unknown"),
-                    "artists": artist_names(track),
-                    "type": track.get("videoType"),
-                }
-            )
-    return tracks
+def search_track(text):
+    """Turn free text like 'Song Artist' into (track, artist) using Last.fm search."""
+    data = lastfm_call("track.search", track=text, limit=1)
+    matches = as_list(data.get("results", {}).get("trackmatches", {}).get("track"))
+    if not matches:
+        return None
+    return matches[0].get("name"), name_of(matches[0].get("artist"))
 
 
-def generate(yt, seed_queries, known_keys, settings, progress):
+@st.cache_data(ttl=3600, show_spinner=False)
+def similar_tracks(artist, track):
+    data = lastfm_call(
+        "track.getSimilar", artist=artist, track=track, limit=SIMILAR_LIMIT, autocorrect=1
+    )
+    results = []
+    for item in as_list(data.get("similartracks", {}).get("track")):
+        title, who = item.get("name"), name_of(item.get("artist"))
+        if title and who:
+            try:
+                match = float(item.get("match") or 0)
+            except (TypeError, ValueError):
+                match = 0.0
+            results.append({"title": title, "artist": who, "match": match})
+    return results
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def similar_from_artist(artist):
+    """Fallback for songs Last.fm has no 'similar tracks' for: top songs of similar artists."""
+    data = lastfm_call("artist.getSimilar", artist=artist, limit=8, autocorrect=1)
+    results = []
+    for item in as_list(data.get("similarartists", {}).get("artist")):
+        who = item.get("name")
+        if not who:
+            continue
+        try:
+            match = float(item.get("match") or 0) * 0.6
+        except (TypeError, ValueError):
+            match = 0.0
+        try:
+            top = lastfm_call("artist.getTopTracks", artist=who, limit=2)
+        except LastFmError as error:
+            if error.code in (10, 26, 29):
+                raise
+            continue
+        for track in as_list(top.get("toptracks", {}).get("track")):
+            if track.get("name"):
+                results.append({"title": track["name"], "artist": who, "match": match})
+    return results
+
+
+def parse_seed_line(line):
+    """'Song - Artist' or 'Song by Artist' -> (track, artist). Otherwise None."""
+    if " - " in line:
+        track, artist = line.rsplit(" - ", 1)
+    else:
+        found = re.match(r"^(.*)\s+by\s+(.+)$", line, re.IGNORECASE)
+        if not found:
+            return None
+        track, artist = found.group(1), found.group(2)
+    track, artist = track.strip(), artist.strip()
+    return (track, artist) if track and artist else None
+
+
+def generate(seeds, known_keys, settings, progress):
+    """seeds: list of dicts: {"label", "track", "artist"} (artist None = needs a search)."""
     counts = Counter()
+    scores = Counter()
     info = {}
-    seed_ids = set()
     seed_keys = set()
     missed = []
-    total = len(seed_queries)
+    fallback_used = 0
+    total = len(seeds)
 
-    for i, query in enumerate(seed_queries, start=1):
-        progress.progress((i - 1) / total, text=f"Looking up: {query}")
-        seed = None
-        reason = "no results found"
+    for i, seed in enumerate(seeds, start=1):
+        label = seed["label"]
+        progress.progress((i - 1) / total, text=f"Looking up: {label}")
+
+        track, artist = seed["track"], seed["artist"]
         try:
-            hits = yt.search(query, filter="songs")
-            seed = next((h for h in hits if h.get("videoId")), None)
-        except Exception as error:
-            reason = f"search failed: {type(error).__name__}: {str(error)[:150]}"
-        if not seed:
-            missed.append(f"{query} ({reason})")
+            if artist is None:
+                found = search_track(label)
+                if not found:
+                    missed.append(f"{label} (not found - try the format 'Song - Artist')")
+                    continue
+                track, artist = found
+            seed_keys.add((normalize(track), normalize(artist)))
+
+            similar = similar_tracks(artist, track)
+            if not similar and fallback_used < FALLBACK_LIMIT:
+                fallback_used += 1
+                similar = similar_from_artist(artist)
+        except LastFmError as error:
+            if error.code in (10, 26, 29, 0):
+                raise  # key problems, rate limit, or network trouble affect everything
+            missed.append(f"{label} (not found on Last.fm)")
             continue
 
-        seed_artists = artist_names(seed)
-        seed_ids.add(seed["videoId"])
-        seed_keys.add((normalize(seed.get("title", "")), normalize(seed_artists[0])))
-
-        try:
-            radio = fetch_radio(seed["videoId"])
-        except Exception as error:
-            reason = f"{type(error).__name__}: {str(error)[:150]}"
-            missed.append(f"{query} (couldn't get similar songs: {reason})")
+        if not similar:
+            missed.append(f"{label} (Last.fm has no similar songs for this one)")
             continue
 
         seen = set()
-        for track in radio:
-            vid = track["videoId"]
-            if vid in seen:
+        for item in similar:
+            key = (normalize(item["title"]), normalize(item["artist"]))
+            if key in seen:
                 continue
-            seen.add(vid)
-            counts[vid] += 1
-            info.setdefault(vid, track)
+            seen.add(key)
+            counts[key] += 1
+            scores[key] += item["match"]
+            info.setdefault(key, item)
 
     progress.progress(1.0, text="Ranking songs...")
 
     candidates = []
-    for vid, matches in counts.items():
-        if vid in seed_ids:
-            continue
-        item = info[vid]
-        key = (normalize(item["title"]), normalize(item["artists"][0]))
+    for key, matches in counts.items():
+        item = info[key]
         if key in seed_keys:
             continue
         if settings["skip_known"] and key in known_keys:
             continue
-        if not passes_filters(item["title"], ", ".join(item["artists"]), item["type"], settings):
+        if not passes_filters(item["title"], item["artist"], settings):
             continue
-        candidates.append((vid, matches, key))
+        # Songs similar to more of your picks rank higher; a little randomness varies each run
+        rank = matches + 0.5 * scores[key] + random.uniform(0, 0.25)
+        candidates.append((rank, key))
 
-    random.shuffle(candidates)
-    candidates.sort(key=lambda c: c[1], reverse=True)
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
 
     rows = []
     per_artist = Counter()
-    used_keys = set()
-    for vid, matches, key in candidates:
-        item = info[vid]
-        main_artist = item["artists"][0]
-        if key in used_keys or per_artist[main_artist] >= settings["per_artist"]:
+    for _, key in candidates:
+        item = info[key]
+        if per_artist[key[1]] >= settings["per_artist"]:
             continue
-        used_keys.add(key)
-        per_artist[main_artist] += 1
+        per_artist[key[1]] += 1
         rows.append(
             {
                 "Keep": True,
                 "Song": item["title"],
-                "Artist": ", ".join(item["artists"]),
-                "Matches": matches,
-                "videoId": vid,
+                "Artist": item["artist"],
+                "Matches": counts[key],
             }
         )
         if len(rows) >= settings["size"]:
@@ -345,14 +441,12 @@ def make_csv(kept):
     return buffer.getvalue()
 
 
-def make_youtube_links(kept):
-    """YouTube's 'watch_videos' link builds a temporary playlist from video IDs."""
-    ids = [row["videoId"] for row in kept]
-    links = []
-    for start in range(0, len(ids), LINK_CHUNK):
-        chunk = ids[start : start + LINK_CHUNK]
-        links.append("https://www.youtube.com/watch_videos?video_ids=" + ",".join(chunk))
-    return links
+def search_links(song, artist):
+    text = f"{song} {artist}"
+    return (
+        "https://music.youtube.com/search?q=" + quote(text),
+        "https://open.spotify.com/search/" + quote(text),
+    )
 
 
 # ---------------------------------------------------------------
@@ -366,10 +460,19 @@ def main():
         "No login needed - you get a list to take to YouTube Music, Spotify, or Apple Music."
     )
 
+    if not get_api_key():
+        st.error(
+            "This app isn't set up yet: it needs a Last.fm API key. "
+            "(Owner: add LASTFM_API_KEY in the app's secrets.)"
+        )
+        st.stop()
+
     # ---- Step 1
     st.header("1. Songs you like")
     manual_text = st.text_area(
-        "One per line: song name + artist", value=EXAMPLE_SONGS, height=140
+        "One per line, like this: Song - Artist",
+        value=EXAMPLE_SONGS,
+        height=140,
     )
 
     files = st.file_uploader(
@@ -380,6 +483,7 @@ def main():
     st.caption(
         "Your files are read in memory just to find your top songs. They aren't saved, "
         "and your history is forgotten when you close the page. "
+        "Song lookups are briefly remembered to keep the app fast. "
         "Get your export at spotify.com/account/privacy."
     )
 
@@ -407,8 +511,7 @@ def main():
     col1, col2 = st.columns(2)
     skip_live = col1.checkbox("Skip live versions", value=True)
     skip_remix = col1.checkbox("Skip remixes / sped up / slowed", value=True)
-    skip_instrumental = col1.checkbox("Skip instrumentals & karaoke", value=True)
-    skip_ugc = col2.checkbox("Skip fan uploads (official songs only)", value=True)
+    skip_instrumental = col2.checkbox("Skip instrumentals & karaoke", value=True)
     skip_known = col2.checkbox(
         "Skip songs I've already played on Spotify", value=True, disabled=not known_keys
     )
@@ -426,7 +529,6 @@ def main():
         "skip_live": skip_live,
         "skip_remix": skip_remix,
         "skip_instrumental": skip_instrumental,
-        "skip_ugc": skip_ugc,
         "skip_known": skip_known and bool(known_keys),
         "language": language,
         "size": size,
@@ -435,7 +537,16 @@ def main():
 
     # ---- Find songs
     if st.button("🎵 Find songs", type="primary"):
-        seeds = [line.strip() for line in manual_text.splitlines() if line.strip()]
+        seeds = []
+        for line in manual_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            pair = parse_seed_line(line)
+            if pair:
+                seeds.append({"label": line, "track": pair[0], "artist": pair[1]})
+            else:
+                seeds.append({"label": line, "track": None, "artist": None})
 
         if use_spotify and spotify_top:
             if shuffle_seeds:
@@ -443,13 +554,13 @@ def main():
                 chosen = random.sample(pool, min(n_spotify, len(pool)))
             else:
                 chosen = spotify_top[:n_spotify]
-            seeds += [f"{track} {artist}" for (track, artist), _ in chosen]
+            for (track, artist), _ in chosen:
+                seeds.append({"label": f"{track} - {artist}", "track": track, "artist": artist})
 
-        unique = []
-        lowered = set()
+        unique, lowered = [], set()
         for seed in seeds:
-            if seed.lower() not in lowered:
-                lowered.add(seed.lower())
+            if seed["label"].lower() not in lowered:
+                lowered.add(seed["label"].lower())
                 unique.append(seed)
         if len(unique) > MAX_SEEDS:
             st.info(f"Using the first {MAX_SEEDS} songs to keep things quick.")
@@ -460,16 +571,18 @@ def main():
         else:
             progress = st.progress(0.0, text="Starting...")
             try:
-                rows, missed, stats = generate(get_yt(), unique, known_keys, settings, progress)
+                rows, missed, stats = generate(unique, known_keys, settings, progress)
                 st.session_state["results"] = rows
                 st.session_state["missed"] = missed
                 st.session_state["stats"] = stats
                 st.session_state["run_id"] = st.session_state.get("run_id", 0) + 1
-            except Exception as error:
-                st.error(
-                    "Something went wrong talking to YouTube Music. "
-                    f"Please try again in a minute. ({error})"
-                )
+            except LastFmError as error:
+                if error.code in (10, 26):
+                    st.error("The app's Last.fm key isn't working. Please tell the person who runs this app.")
+                elif error.code == 29:
+                    st.error("Last.fm says it's too busy right now. Please try again in a minute.")
+                else:
+                    st.error(f"Couldn't reach Last.fm. Please try again in a minute. ({error})")
             progress.empty()
 
     # ---- Results
@@ -484,7 +597,7 @@ def main():
 
         if not rows:
             st.warning(
-                "Nothing made it through your filters. Try turning some off, "
+                "Nothing made it through. Try turning some filters off, "
                 "or adding more songs."
             )
         else:
@@ -496,11 +609,8 @@ def main():
             )
             edited = st.data_editor(
                 rows,
-                column_config={
-                    "Keep": st.column_config.CheckboxColumn("Keep"),
-                    "videoId": None,
-                },
-                disabled=["Song", "Artist", "Matches", "videoId"],
+                column_config={"Keep": st.column_config.CheckboxColumn("Keep")},
+                disabled=["Song", "Artist", "Matches"],
                 hide_index=True,
                 key=f"editor_{st.session_state.get('run_id', 0)}",
             )
@@ -526,20 +636,20 @@ def main():
                 with st.expander("Or copy the list"):
                     st.code(make_text_list(kept), language=None)
 
-                st.subheader("Option B: Open it as a YouTube playlist (experimental)")
-                st.write(
-                    "These links build a playlist on YouTube from the songs. If you're signed in, "
-                    "you can save it to your library, and it should then show up in YouTube Music. "
-                    "This is a YouTube trick that can change or stop working, so if a link "
-                    "doesn't work, use Option A."
-                )
-                for number, link in enumerate(make_youtube_links(kept), start=1):
-                    st.link_button(f"▶️ Open playlist part {number}", link)
+                st.subheader("Option B: Look songs up one at a time")
+                with st.expander("Search links for each song"):
+                    for number, row in enumerate(kept, start=1):
+                        yt_link, sp_link = search_links(row["Song"], row["Artist"])
+                        st.markdown(
+                            f"{number}. {escape_markdown(row['Song'])} - "
+                            f"{escape_markdown(row['Artist'])}  "
+                            f"[YouTube Music]({yt_link}) · [Spotify]({sp_link})"
+                        )
 
     st.divider()
     st.caption(
-        "A hobby project. Not affiliated with Spotify, YouTube, or Apple. "
-        "Recommendations come from YouTube Music's public 'similar songs' results."
+        "A hobby project. Not affiliated with Spotify, YouTube, Apple, or Last.fm. "
+        "Recommendations are powered by Last.fm listening data."
     )
 
 
