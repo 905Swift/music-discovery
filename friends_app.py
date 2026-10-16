@@ -450,6 +450,95 @@ def search_links(song, artist):
 
 
 # ---------------------------------------------------------------
+# Cover art (Deezer's free public search - no key needed)
+# ---------------------------------------------------------------
+DEEZER_URL = "https://api.deezer.com/search"
+IMAGE_HOST = re.compile(r"^https://([\w-]+\.)*(dzcdn\.net|deezer\.com)/")
+
+
+class CoverError(Exception):
+    pass
+
+
+def clean_title(title):
+    """'Song (feat. Someone)' -> 'Song' so the search matches more often."""
+    cleaned = re.sub(r"\s*[\(\[].*?[\)\]]", "", title).strip()
+    return cleaned or title
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_cover(artist, title):
+    """Album cover link for a song, or '' if none was found. Failures are not cached."""
+    short = clean_title(title)
+    wanted = normalize(artist)
+    for query in (f'artist:"{artist}" track:"{short}"', f"{artist} {short}"):
+        try:
+            response = requests.get(
+                DEEZER_URL,
+                params={"q": query, "limit": 3},
+                timeout=8,
+                headers={"User-Agent": USER_AGENT},
+            )
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            raise CoverError("Deezer couldn't be reached")
+        if isinstance(data, dict) and "error" in data:
+            error = data["error"]
+            if isinstance(error, dict) and error.get("code") == 4:
+                raise CoverError("Deezer is busy")
+            continue
+        for item in (data.get("data") or []) if isinstance(data, dict) else []:
+            found = normalize((item.get("artist") or {}).get("name", ""))
+            if wanted and found and (wanted in found or found in wanted):
+                album = item.get("album") or {}
+                url = album.get("cover_medium") or album.get("cover") or ""
+                if url:
+                    return url
+    return ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_image_bytes(url):
+    if not IMAGE_HOST.match(url):
+        raise CoverError("Unexpected image address")
+    response = requests.get(url, timeout=10, headers={"User-Agent": USER_AGENT})
+    if response.status_code != 200 or not response.content:
+        raise CoverError("Couldn't load an image")
+    return response.content
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def build_collage(urls):
+    """Join up to 9 different album covers into one square playlist picture (JPEG)."""
+    from PIL import Image
+
+    tiles = []
+    for url in dict.fromkeys(urls):  # different covers only, in ranked order
+        try:
+            tiles.append(Image.open(io.BytesIO(fetch_image_bytes(url))).convert("RGB"))
+        except Exception:
+            continue
+        if len(tiles) == 9:
+            break
+    if not tiles:
+        return None
+
+    grid = 3 if len(tiles) >= 9 else 2 if len(tiles) >= 4 else 1
+    tiles = tiles[: grid * grid]
+    size = 640 // grid
+    canvas = Image.new("RGB", (size * grid, size * grid))
+    for index, tile in enumerate(tiles):
+        canvas.paste(tile.resize((size, size)), ((index % grid) * size, (index // grid) * size))
+
+    for quality in (90, 80, 70, 60, 50):  # keep the file small (under about 240 KB)
+        buffer = io.BytesIO()
+        canvas.save(buffer, "JPEG", quality=quality)
+        if buffer.tell() <= 240_000:
+            break
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------
 # The page
 # ---------------------------------------------------------------
 def main():
@@ -646,10 +735,60 @@ def main():
                             f"[YouTube Music]({yt_link}) · [Spotify]({sp_link})"
                         )
 
+                st.header("Cover art")
+                covers = st.session_state.setdefault("covers", {})
+                missing = [r for r in kept if (r["Song"], r["Artist"]) not in covers]
+                if missing and st.button("🖼️ Load cover art"):
+                    bar = st.progress(0.0, text="Loading covers...")
+                    try:
+                        for number, row in enumerate(missing, start=1):
+                            covers[(row["Song"], row["Artist"])] = find_cover(
+                                row["Artist"], row["Song"]
+                            )
+                            bar.progress(
+                                number / len(missing),
+                                text=f"Loading covers... {number}/{len(missing)}",
+                            )
+                    except CoverError as error:
+                        st.warning(
+                            f"Couldn't finish loading covers ({error}). Try again in a minute."
+                        )
+                    bar.empty()
+
+                with_covers = [
+                    (row, covers.get((row["Song"], row["Artist"]))) for row in kept
+                ]
+                with_covers = [(row, url) for row, url in with_covers if url]
+                if with_covers:
+                    collage = build_collage(tuple(url for _, url in with_covers))
+                    if collage:
+                        st.subheader("Playlist cover")
+                        st.image(collage, caption="Made from your top songs' album covers", width=260)
+                        st.download_button(
+                            "⬇️ Download playlist cover (JPEG)",
+                            collage,
+                            file_name="playlist_cover.jpg",
+                            mime="image/jpeg",
+                        )
+                        st.caption(
+                            "Some apps let you set your own playlist picture (Spotify does). "
+                            "Check the app you use."
+                        )
+                    with st.expander("Cover art for each song", expanded=True):
+                        columns = st.columns(4)
+                        for index, (row, url) in enumerate(with_covers):
+                            with columns[index % 4]:
+                                st.image(url, caption=f"{row['Song']} - {row['Artist']}")
+                    no_cover = len(kept) - len(with_covers)
+                    if no_cover > 0 and not missing:
+                        st.caption(f"No cover found for {no_cover} song(s).")
+                elif not missing and covers:
+                    st.caption("No cover art was found for these songs.")
+
     st.divider()
     st.caption(
         "A hobby project. Not affiliated with Spotify, YouTube, Apple, or Last.fm. "
-        "Recommendations are powered by Last.fm listening data."
+        "Recommendations are powered by Last.fm listening data. Cover art from Deezer's public search."
     )
 
 
